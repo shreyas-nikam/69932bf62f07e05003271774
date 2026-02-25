@@ -1,5 +1,8 @@
 import pandas as pd
 import numpy as np
+import os
+import hashlib
+import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -32,6 +35,18 @@ except ImportError:
     # In such cases, tf.math functions might be directly used or K. functions.
     pass
 
+# Create cache directory for trained models
+CACHE_DIR = os.path.join(os.path.dirname(__file__), 'model_cache')
+if not os.path.exists(CACHE_DIR):
+    os.makedirs(CACHE_DIR)
+    print(f"Created model cache directory: {CACHE_DIR}")
+
+
+def get_cache_key(*args):
+    """Generate a deterministic cache key from arguments."""
+    key_str = "_".join(str(arg) for arg in args)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
 
 def load_and_preprocess_data(filepath=None, test_size=0.2, random_state=42, n_samples=100000):
     """
@@ -62,9 +77,12 @@ def load_and_preprocess_data(filepath=None, test_size=0.2, random_state=42, n_sa
     df['real_estate_lines'] = np.random.randint(0, 10, n_samples)
     df['dependents'] = np.random.poisson(lam=0.5, size=n_samples)
 
-    df['past_due_30'] = (np.random.rand(n_samples) < 0.9).astype(int) * np.random.poisson(lam=0.1, size=n_samples)
-    df['past_due_60'] = (df['past_due_30'] > 0).astype(int) * (np.random.rand(n_samples) < 0.7).astype(int) * np.random.poisson(lam=0.05, size=n_samples)
-    df['past_due_90'] = (df['past_due_60'] > 0).astype(int) * (np.random.rand(n_samples) < 0.5).astype(int) * np.random.poisson(lam=0.02, size=n_samples)
+    df['past_due_30'] = (np.random.rand(n_samples) < 0.9).astype(
+        int) * np.random.poisson(lam=0.1, size=n_samples)
+    df['past_due_60'] = (df['past_due_30'] > 0).astype(int) * (np.random.rand(
+        n_samples) < 0.7).astype(int) * np.random.poisson(lam=0.05, size=n_samples)
+    df['past_due_90'] = (df['past_due_60'] > 0).astype(int) * (np.random.rand(
+        n_samples) < 0.5).astype(int) * np.random.poisson(lam=0.02, size=n_samples)
 
     default_prob = (0.01
                     + 0.05 * df['utilization']
@@ -74,13 +92,14 @@ def load_and_preprocess_data(filepath=None, test_size=0.2, random_state=42, n_sa
                     + 0.05 * (df['past_due_30'] > 0).astype(int)
                     + 0.08 * (df['past_due_60'] > 0).astype(int)
                     + 0.10 * (df['past_due_90'] > 0).astype(int)
-                   ).clip(0, 1)
+                    ).clip(0, 1)
 
     df['default'] = (np.random.rand(n_samples) < default_prob).astype(int)
 
     current_default_rate = df['default'].mean()
     if current_default_rate < 0.02 or current_default_rate > 0.05:
-        print(f"Initial synthetic default rate: {current_default_rate:.2%}. Adjusting...")
+        print(
+            f"Initial synthetic default rate: {current_default_rate:.2%}. Adjusting...")
         num_defaults_to_flip = int(n_samples * 0.03 - df['default'].sum())
         if num_defaults_to_flip > 0:
             non_default_indices = df[df['default'] == 0].index.to_numpy()
@@ -106,8 +125,10 @@ def load_and_preprocess_data(filepath=None, test_size=0.2, random_state=42, n_sa
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    X_train_scaled = pd.DataFrame(X_train_scaled, columns=X.columns).reset_index(drop=True)
-    X_test_scaled = pd.DataFrame(X_test_scaled, columns=X.columns).reset_index(drop=True)
+    X_train_scaled = pd.DataFrame(
+        X_train_scaled, columns=X.columns).reset_index(drop=True)
+    X_test_scaled = pd.DataFrame(
+        X_test_scaled, columns=X.columns).reset_index(drop=True)
     y_train = y_train.reset_index(drop=True)
     y_test = y_test.reset_index(drop=True)
 
@@ -115,19 +136,23 @@ def load_and_preprocess_data(filepath=None, test_size=0.2, random_state=42, n_sa
     non_defaults_train = X_train_scaled[y_train == 0]
 
     print(f"Total synthetic dataset size: {len(df):,}")
-    print(f"Synthetic Defaults: {df['default'].sum():,} ({df['default'].mean():.2%})")
+    print(
+        f"Synthetic Defaults: {df['default'].sum():,} ({df['default'].mean():.2%})")
     print(f"Synthetic Non-defaults: {(1 - df['default']).sum():,}")
     print(f"\nTraining set size: {len(X_train_scaled):,}")
-    print(f"Training set Defaults: {len(defaults_train):,} ({y_train.mean():.2%})")
+    print(
+        f"Training set Defaults: {len(defaults_train):,} ({y_train.mean():.2%})")
     print(f"Training set Non-defaults: {len(non_defaults_train):,}")
     print(f"\nTest set size: {len(X_test_scaled):,}")
     print(f"Test set Defaults: {y_test.sum():,} ({y_test.mean():.2%})")
 
     return X_train_scaled, X_test_scaled, y_train, y_test, defaults_train, non_defaults_train, scaler
 
+
 def train_and_evaluate_xgboost(X_train, y_train, X_test, y_test, model_name="Baseline"):
     """
     Trains an XGBoost classifier and evaluates its performance.
+    Uses caching to avoid retraining if model already exists.
 
     Args:
         X_train (pd.DataFrame or np.array): Training features.
@@ -139,15 +164,30 @@ def train_and_evaluate_xgboost(X_train, y_train, X_test, y_test, model_name="Bas
     Returns:
         tuple: Trained model, y_probabilities, AUC, Average Precision
     """
-    model = xgb.XGBClassifier(
-        n_estimators=200,
-        max_depth=5,
-        learning_rate=0.1,
-        eval_metric='auc',
-        random_state=42,
-        use_label_encoder=False
+    # Generate cache key based on model parameters and data characteristics
+    cache_key = get_cache_key(
+        'xgboost'
     )
-    model.fit(X_train, y_train)
+    cache_path = os.path.join(CACHE_DIR, f'xgb_{cache_key}.pkl')
+
+    # Try to load cached model
+    if os.path.exists(cache_path):
+        print(f"Loading cached {model_name} XGBoost model from {cache_path}")
+        model = joblib.load(cache_path)
+    else:
+        print(f"Training {model_name} XGBoost model...")
+        model = xgb.XGBClassifier(
+            n_estimators=200,
+            max_depth=5,
+            learning_rate=0.1,
+            eval_metric='auc',
+            random_state=42,
+            use_label_encoder=False
+        )
+        model.fit(X_train, y_train)
+        # Save model to cache
+        joblib.dump(model, cache_path)
+        print(f"Saved {model_name} model to cache: {cache_path}")
 
     y_prob = model.predict_proba(X_test)[:, 1]
     auc = roc_auc_score(y_test, y_prob)
@@ -160,9 +200,11 @@ def train_and_evaluate_xgboost(X_train, y_train, X_test, y_test, model_name="Bas
 
     return model, y_prob, auc, ap
 
+
 def apply_smote_and_train_xgboost(X_train, y_train, X_test, y_test, random_state=42):
     """
     Applies SMOTE to training data, then trains and evaluates an XGBoost classifier.
+    Uses caching for SMOTE resampled data and model.
 
     Args:
         X_train (pd.DataFrame or np.array): Original training features.
@@ -174,8 +216,25 @@ def apply_smote_and_train_xgboost(X_train, y_train, X_test, y_test, random_state
     Returns:
         tuple: Trained model, y_probabilities, AUC, Average Precision, X_smote, y_smote
     """
-    smote = SMOTE(random_state=random_state, k_neighbors=5)
-    X_smote, y_smote = smote.fit_resample(X_train, y_train)
+    # Generate cache key for SMOTE data
+    smote_cache_key = get_cache_key(
+        'smote_data'
+    )
+    smote_data_path = os.path.join(
+        CACHE_DIR, f'smote_data_{smote_cache_key}.pkl')
+
+    # Try to load cached SMOTE data
+    if os.path.exists(smote_data_path):
+        print(f"Loading cached SMOTE resampled data from {smote_data_path}")
+        smote_data = joblib.load(smote_data_path)
+        X_smote, y_smote = smote_data['X_smote'], smote_data['y_smote']
+    else:
+        print(f"Applying SMOTE to training data...")
+        smote = SMOTE(random_state=random_state, k_neighbors=5)
+        X_smote, y_smote = smote.fit_resample(X_train, y_train)
+        # Save SMOTE data to cache
+        joblib.dump({'X_smote': X_smote, 'y_smote': y_smote}, smote_data_path)
+        print(f"Saved SMOTE data to cache: {smote_data_path}")
 
     print(f"Training set after SMOTE: {len(X_smote):,} samples")
     print(f"  Defaults: {y_smote.sum():,} ({y_smote.mean():.2%})")
@@ -188,6 +247,15 @@ def apply_smote_and_train_xgboost(X_train, y_train, X_test, y_test, random_state
 
     return model_smote, y_prob_smote, auc_smote, ap_smote, X_smote, y_smote
 
+
+@keras.saving.register_keras_serializable(package='Custom')
+def sampling(args):
+    """Sampling function for the CVAE reparameterization trick."""
+    z_mean, z_log_var = args
+    eps = tf.random.normal(shape=tf.shape(z_mean))
+    return z_mean + tf.keras.ops.exp(0.5 * z_log_var) * eps
+
+
 class CVAE(tf.keras.Model):
     def __init__(self, input_dim, latent_dim=8, n_classes=2, hidden_dims=[64, 32], **kwargs):
         super(CVAE, self).__init__(**kwargs)
@@ -198,17 +266,22 @@ class CVAE(tf.keras.Model):
 
         self.encoder_layers = []
         for dim in hidden_dims:
-            self.encoder_layers.append(tf.keras.layers.Dense(dim, activation='relu'))
+            self.encoder_layers.append(
+                tf.keras.layers.Dense(dim, activation='relu'))
             self.encoder_layers.append(tf.keras.layers.BatchNormalization())
             self.encoder_layers.append(tf.keras.layers.Dropout(0.2))
-        self.z_mean_layer = tf.keras.layers.Dense(latent_dim, name='z_mean_output')
-        self.z_log_var_layer = tf.keras.layers.Dense(latent_dim, name='z_log_var_output')
+        self.z_mean_layer = tf.keras.layers.Dense(
+            latent_dim, name='z_mean_output')
+        self.z_log_var_layer = tf.keras.layers.Dense(
+            latent_dim, name='z_log_var_output')
 
         self.decoder_layers = []
         for dim in reversed(hidden_dims):
-            self.decoder_layers.append(tf.keras.layers.Dense(dim, activation='relu'))
+            self.decoder_layers.append(
+                tf.keras.layers.Dense(dim, activation='relu'))
             self.decoder_layers.append(tf.keras.layers.BatchNormalization())
-        self.decoder_output_layer = tf.keras.layers.Dense(input_dim, activation='linear', name='x_decoded_output')
+        self.decoder_output_layer = tf.keras.layers.Dense(
+            input_dim, activation='linear', name='x_decoded_output')
 
         x_input_enc = tf.keras.layers.Input(shape=(input_dim,), name='x_input')
         y_input_enc = tf.keras.layers.Input(shape=(n_classes,), name='y_input')
@@ -219,31 +292,33 @@ class CVAE(tf.keras.Model):
         z_mean_enc = self.z_mean_layer(h_enc)
         z_log_var_enc = self.z_log_var_layer(h_enc)
 
-        def sampling(args):
-            z_mean, z_log_var = args
-            eps = tf.random.normal(shape=tf.shape(z_mean))
-            return z_mean + tf.keras.ops.exp(0.5 * z_log_var) * eps
-        z_enc = tf.keras.layers.Lambda(sampling, name='z_sample')([z_mean_enc, z_log_var_enc])
-        self.encoder = tf.keras.models.Model(inputs=[x_input_enc, y_input_enc], outputs=[z_mean_enc, z_log_var_enc, z_enc], name='encoder')
+        z_enc = tf.keras.layers.Lambda(sampling, name='z_sample')([
+            z_mean_enc, z_log_var_enc])
+        self.encoder = tf.keras.models.Model(inputs=[x_input_enc, y_input_enc], outputs=[
+                                             z_mean_enc, z_log_var_enc, z_enc], name='encoder')
 
-        z_input_dec = tf.keras.layers.Input(shape=(latent_dim,), name='z_input')
-        y_input_dec = tf.keras.layers.Input(shape=(n_classes,), name='y_input_dec')
+        z_input_dec = tf.keras.layers.Input(
+            shape=(latent_dim,), name='z_input')
+        y_input_dec = tf.keras.layers.Input(
+            shape=(n_classes,), name='y_input_dec')
         dec_in = tf.keras.layers.Concatenate()([z_input_dec, y_input_dec])
         h_dec = dec_in
         for layer in self.decoder_layers:
             h_dec = layer(h_dec)
         x_decoded_dec = self.decoder_output_layer(h_dec)
-        self.decoder = tf.keras.models.Model(inputs=[z_input_dec, y_input_dec], outputs=x_decoded_dec, name='decoder')
-
+        self.decoder = tf.keras.models.Model(
+            inputs=[z_input_dec, y_input_dec], outputs=x_decoded_dec, name='decoder')
 
     def call(self, inputs):
         x_input, y_input = inputs
         z_mean_out, z_log_var_out, z_out = self.encoder([x_input, y_input])
         x_recon = self.decoder([z_out, y_input])
 
-        recon_loss = tf.keras.ops.mean(tf.keras.ops.square(x_input - x_recon), axis=-1)
+        recon_loss = tf.keras.ops.mean(
+            tf.keras.ops.square(x_input - x_recon), axis=-1)
         kl_loss = -0.5 * tf.keras.ops.mean(
-            1 + z_log_var_out - tf.keras.ops.square(z_mean_out) - tf.keras.ops.exp(z_log_var_out),
+            1 + z_log_var_out -
+            tf.keras.ops.square(z_mean_out) - tf.keras.ops.exp(z_log_var_out),
             axis=-1
         )
         total_loss = tf.keras.ops.mean(recon_loss + 0.5 * kl_loss)
@@ -252,9 +327,27 @@ class CVAE(tf.keras.Model):
 
         return x_recon
 
+    def get_config(self):
+        """Returns the config of the model for serialization."""
+        config = super(CVAE, self).get_config()
+        config.update({
+            'input_dim': self.input_dim,
+            'latent_dim': self.latent_dim,
+            'n_classes': self.n_classes,
+            'hidden_dims': self.hidden_dims,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        """Creates a CVAE model from its config."""
+        return cls(**config)
+
+
 def train_cvae(X_train_scaled, y_train, latent_dim=8, n_classes=2, epochs=100, batch_size=64, validation_split=0.15):
     """
     Trains the Conditional Variational Autoencoder (CVAE) model.
+    Uses caching to avoid retraining if model already exists.
 
     Args:
         X_train_scaled (pd.DataFrame): Scaled training features.
@@ -271,36 +364,64 @@ def train_cvae(X_train_scaled, y_train, latent_dim=8, n_classes=2, epochs=100, b
     y_train_oh = to_categorical(y_train, num_classes=n_classes)
     input_dim = X_train_scaled.shape[1]
 
-    cvae_model_instance = CVAE(input_dim, latent_dim=latent_dim, n_classes=n_classes)
-    cvae_model_instance.compile(optimizer='adam')
-
-    print("CVAE Model Summary:")
-    cvae_model_instance.build(input_shape=[(None, input_dim), (None, n_classes)])
-    cvae_model_instance.summary()
-
-    early_stopping = tf.keras.callbacks.EarlyStopping(
-        monitor='val_loss',
-        patience=10,
-        restore_best_weights=True,
-        verbose=1
+    # Generate cache key based on model architecture and training parameters
+    cache_key = get_cache_key(
+        'cvae'
     )
+    cache_path = os.path.join(CACHE_DIR, f'cvae_{cache_key}.keras')
+    encoder_path = os.path.join(CACHE_DIR, f'cvae_encoder_{cache_key}.keras')
+    decoder_path = os.path.join(CACHE_DIR, f'cvae_decoder_{cache_key}.keras')
 
-    print("\nTraining Conditional VAE...")
-    history = cvae_model_instance.fit(
-        [X_train_scaled, y_train_oh],
-        X_train_scaled,
-        epochs=epochs,
-        batch_size=batch_size,
-        validation_split=validation_split,
-        callbacks=[early_stopping],
-        verbose=0
-    )
-    print("CVAE trained successfully.")
+    # Try to load cached models
+    if os.path.exists(cache_path) and os.path.exists(encoder_path) and os.path.exists(decoder_path):
+        print(f"Loading cached CVAE model from {cache_path}")
+        custom_objects = {'CVAE': CVAE, 'sampling': sampling}
+        cvae_model_instance = tf.keras.models.load_model(
+            cache_path, custom_objects=custom_objects)
+        encoder = tf.keras.models.load_model(encoder_path, custom_objects=custom_objects)
+        decoder = tf.keras.models.load_model(decoder_path, custom_objects=custom_objects)
+        print("CVAE models loaded successfully from cache.")
+    else:
+        print(f"Training new CVAE model...")
+        cvae_model_instance = CVAE(
+            input_dim, latent_dim=latent_dim, n_classes=n_classes)
+        cvae_model_instance.compile(optimizer='adam')
 
-    encoder = cvae_model_instance.encoder
-    decoder = cvae_model_instance.decoder
+        print("CVAE Model Summary:")
+        cvae_model_instance.build(
+            input_shape=[(None, input_dim), (None, n_classes)])
+        cvae_model_instance.summary()
+
+        early_stopping = tf.keras.callbacks.EarlyStopping(
+            monitor='val_loss',
+            patience=10,
+            restore_best_weights=True,
+            verbose=1
+        )
+
+        print("\nTraining Conditional VAE...")
+        history = cvae_model_instance.fit(
+            [X_train_scaled, y_train_oh],
+            X_train_scaled,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_split=validation_split,
+            callbacks=[early_stopping],
+            verbose=0
+        )
+        print("CVAE trained successfully.")
+
+        # Save models to cache
+        cvae_model_instance.save(cache_path)
+        cvae_model_instance.encoder.save(encoder_path)
+        cvae_model_instance.decoder.save(decoder_path)
+        print(f"Saved CVAE models to cache: {cache_path}")
+
+        encoder = cvae_model_instance.encoder
+        decoder = cvae_model_instance.decoder
 
     return cvae_model_instance, encoder, decoder, latent_dim
+
 
 def generate_synthetic_defaults(decoder_model, n_samples, latent_dim, n_classes=2):
     """
@@ -316,13 +437,15 @@ def generate_synthetic_defaults(decoder_model, n_samples, latent_dim, n_classes=
         np.array: Numpy array of generated synthetic default records.
     """
     if n_samples <= 0:
-        return np.empty((0, decoder_model.output_shape[1])) # Return empty array with correct feature dim
+        # Return empty array with correct feature dim
+        return np.empty((0, decoder_model.output_shape[1]))
 
     z_samples = np.random.normal(0, 1, (n_samples, latent_dim))
     y_default_cond = np.zeros((n_samples, n_classes))
     y_default_cond[:, 1] = 1.0
 
-    synthetic_records_np = decoder_model.predict([z_samples, y_default_cond], verbose=0)
+    synthetic_records_np = decoder_model.predict(
+        [z_samples, y_default_cond], verbose=0)
     return synthetic_records_np
 
 
@@ -352,20 +475,27 @@ def augment_with_vae_and_train_xgboost(
     n_non_defaults_real = len(non_defaults_train_df)
     n_defaults_needed = n_non_defaults_real - n_defaults_real
 
-    n_synthetic_to_generate = min(n_defaults_needed, n_defaults_real * max_synthetic_ratio)
-    n_synthetic_to_generate = max(0, int(n_synthetic_to_generate)) # Ensure non-negative integer
+    n_synthetic_to_generate = min(
+        n_defaults_needed, n_defaults_real * max_synthetic_ratio)
+    # Ensure non-negative integer
+    n_synthetic_to_generate = max(0, int(n_synthetic_to_generate))
 
-    synth_defaults_df = pd.DataFrame(columns=X_train_scaled.columns) # Initialize empty
+    synth_defaults_df = pd.DataFrame(
+        columns=X_train_scaled.columns)  # Initialize empty
     if n_synthetic_to_generate <= 0:
         print("No synthetic defaults needed or cap reached. Skipping VAE augmentation.")
         return None, None, None, None, X_train_scaled, y_train, synth_defaults_df
 
-    synth_defaults_np = generate_synthetic_defaults(decoder_model, n_synthetic_to_generate, latent_dim_cvae)
-    synth_defaults_df = pd.DataFrame(synth_defaults_np, columns=X_train_scaled.columns)
+    synth_defaults_np = generate_synthetic_defaults(
+        decoder_model, n_synthetic_to_generate, latent_dim_cvae)
+    synth_defaults_df = pd.DataFrame(
+        synth_defaults_np, columns=X_train_scaled.columns)
     print(f"Generated {len(synth_defaults_df):,} synthetic default records.")
 
-    X_augmented = pd.concat([X_train_scaled, synth_defaults_df], ignore_index=True)
-    y_augmented = pd.concat([y_train, pd.Series(1, index=range(len(synth_defaults_df)))], ignore_index=True)
+    X_augmented = pd.concat(
+        [X_train_scaled, synth_defaults_df], ignore_index=True)
+    y_augmented = pd.concat([y_train, pd.Series(
+        1, index=range(len(synth_defaults_df)))], ignore_index=True)
 
     shuffled_indices = np.random.permutation(len(X_augmented))
     X_augmented = X_augmented.iloc[shuffled_indices].reset_index(drop=True)
@@ -386,6 +516,7 @@ def augment_with_vae_and_train_xgboost(
 def run_tstr_protocol(X_train_scaled, y_train, X_test_scaled, y_test, decoder, latent_dim_cvae, auc_base, n_classes=2, random_state=42):
     """
     Implements the Train-on-Synthetic, Test-on-Real (TSTR) protocol.
+    Uses caching for synthetic data and trained TSTR model.
 
     Args:
         X_train_scaled (pd.DataFrame): Scaled real training features.
@@ -406,46 +537,91 @@ def run_tstr_protocol(X_train_scaled, y_train, X_test_scaled, y_test, decoder, l
 
     n_defaults_real = y_train.sum()
     n_non_defaults_real = (y_train == 0).sum()
-    
+
     # Target size for each class in the synthetic dataset, aiming for balance
     # Can be max(n_defaults_real, n_non_defaults_real) or a fixed number
-    n_synthetic_per_class_tstr = n_non_defaults_real # Match majority class count from real data
+    # Match majority class count from real data
+    n_synthetic_per_class_tstr = n_non_defaults_real
 
     if n_synthetic_per_class_tstr <= 0 or decoder is None:
         print("Not enough samples or decoder not available to generate for TSTR. Skipping TSTR.")
         return np.nan, None, np.nan
 
-    synth_defaults_tstr_np = generate_synthetic_defaults(decoder, n_synthetic_per_class_tstr, latent_dim_cvae, n_classes)
-    synth_defaults_tstr_df = pd.DataFrame(synth_defaults_tstr_np, columns=X_train_scaled.columns)
-
-    z_non_default_tstr = np.random.normal(0, 1, (n_synthetic_per_class_tstr, latent_dim_cvae))
-    y_non_default_cond_tstr = np.zeros((n_synthetic_per_class_tstr, n_classes))
-    y_non_default_cond_tstr[:, 0] = 1.0
-    synth_non_defaults_tstr_np = decoder.predict([z_non_default_tstr, y_non_default_cond_tstr], verbose=0)
-    synth_non_defaults_tstr_df = pd.DataFrame(synth_non_defaults_tstr_np, columns=X_train_scaled.columns)
-
-    X_synth_only = pd.concat([synth_defaults_tstr_df, synth_non_defaults_tstr_df], ignore_index=True)
-    y_synth_only = pd.Series([1]*len(synth_defaults_tstr_df) + [0]*len(synth_non_defaults_tstr_df))
-
-    shuffled_idx_tstr = np.random.permutation(len(X_synth_only))
-    X_synth_only = X_synth_only.iloc[shuffled_idx_tstr].reset_index(drop=True)
-    y_synth_only = y_synth_only.iloc[shuffled_idx_tstr].reset_index(drop=True)
-
-    print(f"Training a model *only* on {len(X_synth_only):,} synthetic records for TSTR.")
-    model_tstr = xgb.XGBClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.1,
-        eval_metric='auc', random_state=random_state, use_label_encoder=False
+    # Generate cache key for TSTR synthetic data
+    tstr_cache_key = get_cache_key(
+        'tstr_synth'
     )
-    model_tstr.fit(X_synth_only, y_synth_only)
+    tstr_data_path = os.path.join(
+        CACHE_DIR, f'tstr_synth_{tstr_cache_key}.pkl')
+    tstr_model_path = os.path.join(
+        CACHE_DIR, f'tstr_model_{tstr_cache_key}.pkl')
+
+    # Try to load cached TSTR synthetic data
+    if os.path.exists(tstr_data_path):
+        print(f"Loading cached TSTR synthetic data from {tstr_data_path}")
+        tstr_data = joblib.load(tstr_data_path)
+        X_synth_only = tstr_data['X_synth_only']
+        y_synth_only = tstr_data['y_synth_only']
+    else:
+        print(f"Generating synthetic data for TSTR...")
+        synth_defaults_tstr_np = generate_synthetic_defaults(
+            decoder, n_synthetic_per_class_tstr, latent_dim_cvae, n_classes)
+        synth_defaults_tstr_df = pd.DataFrame(
+            synth_defaults_tstr_np, columns=X_train_scaled.columns)
+
+        z_non_default_tstr = np.random.normal(
+            0, 1, (n_synthetic_per_class_tstr, latent_dim_cvae))
+        y_non_default_cond_tstr = np.zeros(
+            (n_synthetic_per_class_tstr, n_classes))
+        y_non_default_cond_tstr[:, 0] = 1.0
+        synth_non_defaults_tstr_np = decoder.predict(
+            [z_non_default_tstr, y_non_default_cond_tstr], verbose=0)
+        synth_non_defaults_tstr_df = pd.DataFrame(
+            synth_non_defaults_tstr_np, columns=X_train_scaled.columns)
+
+        X_synth_only = pd.concat(
+            [synth_defaults_tstr_df, synth_non_defaults_tstr_df], ignore_index=True)
+        y_synth_only = pd.Series(
+            [1]*len(synth_defaults_tstr_df) + [0]*len(synth_non_defaults_tstr_df))
+
+        shuffled_idx_tstr = np.random.permutation(len(X_synth_only))
+        X_synth_only = X_synth_only.iloc[shuffled_idx_tstr].reset_index(
+            drop=True)
+        y_synth_only = y_synth_only.iloc[shuffled_idx_tstr].reset_index(
+            drop=True)
+
+        # Save synthetic data to cache
+        joblib.dump({'X_synth_only': X_synth_only,
+                    'y_synth_only': y_synth_only}, tstr_data_path)
+        print(f"Saved TSTR synthetic data to cache: {tstr_data_path}")
+
+    # Try to load cached TSTR model
+    if os.path.exists(tstr_model_path):
+        print(f"Loading cached TSTR model from {tstr_model_path}")
+        model_tstr = joblib.load(tstr_model_path)
+    else:
+        print(
+            f"Training a model *only* on {len(X_synth_only):,} synthetic records for TSTR.")
+        model_tstr = xgb.XGBClassifier(
+            n_estimators=200, max_depth=5, learning_rate=0.1,
+            eval_metric='auc', random_state=random_state, use_label_encoder=False
+        )
+        model_tstr.fit(X_synth_only, y_synth_only)
+        # Save model to cache
+        joblib.dump(model_tstr, tstr_model_path)
+        print(f"Saved TSTR model to cache: {tstr_model_path}")
+
     y_prob_tstr = model_tstr.predict_proba(X_test_scaled)[:, 1]
     auc_tstr = roc_auc_score(y_test, y_prob_tstr)
 
-    print(f"\nTSTR AUC (trained ONLY on synthetic, tested on real): {auc_tstr:.4f}")
+    print(
+        f"\nTSTR AUC (trained ONLY on synthetic, tested on real): {auc_tstr:.4f}")
     print(f"Real data AUC (baseline): {auc_base:.4f}")
     tstr_ratio = np.nan
     if auc_base > 0:
         tstr_ratio = auc_tstr / auc_base
-        print(f"TSTR Ratio: {tstr_ratio:.2%}" + " (Target > 80% for good utility)")
+        print(f"TSTR Ratio: {tstr_ratio:.2%}" +
+              " (Target > 80% for good utility)")
     else:
         print("Baseline AUC is zero, cannot compute TSTR ratio.")
 
@@ -463,27 +639,32 @@ def perform_distribution_comparison(real_defaults_inv_df, synth_defaults_inv_df,
         output_filename (str): Filename to save the distribution comparison plot.
 
     Returns:
-        pd.DataFrame: DataFrame containing KS test results.
+        tuple: (DataFrame containing KS test results, matplotlib figure or None)
     """
     print("\n--- Feature Distribution Comparison (KS Test & Overlays) ---")
     if real_defaults_inv_df.empty or synth_defaults_inv_df.empty:
         print("Skipping distribution comparison due to empty dataframes.")
-        return pd.DataFrame(columns=['Feature', 'KS Statistic', 'P-value', 'Status'])
+        return pd.DataFrame(columns=['Feature', 'KS Statistic', 'P-value', 'Status']), None
 
     print("Column-wise KS Tests (Real vs Synthetic Defaults):")
     ks_test_results = []
     for col in real_defaults_inv_df.columns:
         if col in synth_defaults_inv_df.columns:
-            ks_stat, p_val = ks_2samp(real_defaults_inv_df[col], synth_defaults_inv_df[col])
+            ks_stat, p_val = ks_2samp(
+                real_defaults_inv_df[col], synth_defaults_inv_df[col])
             status = "OK" if p_val > 0.05 else "MISMATCH"
-            ks_test_results.append({'Feature': col, 'KS Statistic': ks_stat, 'P-value': p_val, 'Status': status})
+            ks_test_results.append(
+                {'Feature': col, 'KS Statistic': ks_stat, 'P-value': p_val, 'Status': status})
             print(f"  {col:20s}: KS={ks_stat:.4f}, p={p_val:.4f} [{status}]")
         else:
-            print(f"  Warning: Feature '{col}' not found in synthetic data for KS test.")
+            print(
+                f"  Warning: Feature '{col}' not found in synthetic data for KS test.")
 
     ks_results_df = pd.DataFrame(ks_test_results)
 
-    plot_features = [f for f in features_to_plot if f in real_defaults_inv_df.columns and f in synth_defaults_inv_df.columns]
+    plot_features = [
+        f for f in features_to_plot if f in real_defaults_inv_df.columns and f in synth_defaults_inv_df.columns]
+    fig = None
     if plot_features:
         num_plots = len(plot_features)
         fig_rows = int(np.ceil(num_plots / 2))
@@ -491,24 +672,26 @@ def perform_distribution_comparison(real_defaults_inv_df, synth_defaults_inv_df,
         axes = axes.flatten()
 
         for i, col in enumerate(plot_features):
-            sns.histplot(real_defaults_inv_df[col], kde=True, color='blue', label='Real Defaults', ax=axes[i], stat='density', alpha=0.6)
-            sns.histplot(synth_defaults_inv_df[col], kde=True, color='red', label='Synthetic Defaults (VAE)', ax=axes[i], stat='density', alpha=0.6)
+            sns.histplot(real_defaults_inv_df[col], kde=True, color='blue',
+                         label='Real Defaults', ax=axes[i], stat='density', alpha=0.6)
+            sns.histplot(synth_defaults_inv_df[col], kde=True, color='red',
+                         label='Synthetic Defaults (VAE)', ax=axes[i], stat='density', alpha=0.6)
             axes[i].set_title(f'Distribution of {col}', fontsize=14)
             axes[i].legend()
             axes[i].set_xlabel(col, fontsize=12)
             axes[i].set_ylabel('Density', fontsize=12)
-        
+
         for j in range(num_plots, len(axes)):
             fig.delaxes(axes[j])
 
-        plt.suptitle('Marginal Feature Distribution Comparison (Real vs. Synthetic Defaults)', fontsize=16, y=1.02)
+        plt.suptitle(
+            'Marginal Feature Distribution Comparison (Real vs. Synthetic Defaults)', fontsize=16, y=1.02)
         plt.tight_layout(rect=[0, 0.03, 1, 0.98])
         plt.savefig(output_filename, dpi=150)
-        plt.show()
     else:
         print("No valid features to plot for distribution comparison.")
 
-    return ks_results_df
+    return ks_results_df, fig
 
 
 def perform_correlation_comparison(real_defaults_inv_df, synth_defaults_inv_df, output_filename='correlation_preservation.png'):
@@ -521,112 +704,124 @@ def perform_correlation_comparison(real_defaults_inv_df, synth_defaults_inv_df, 
         output_filename (str): Filename to save the correlation heatmaps.
 
     Returns:
-        float: Frobenius error between correlation matrices.
+        tuple: (Frobenius error between correlation matrices, matplotlib figure or None)
     """
     print("\n--- Correlation Structure Preservation (Frobenius Error & Heatmaps) ---")
     if real_defaults_inv_df.empty or synth_defaults_inv_df.empty or len(real_defaults_inv_df.columns) < 2:
         print("Skipping correlation comparison due to empty dataframes or insufficient features.")
-        return np.nan
+        return np.nan, None
 
     real_corr = real_defaults_inv_df.corr()
     synth_corr = synth_defaults_inv_df.corr()
 
     frobenius_error = np.linalg.norm(real_corr - synth_corr, 'fro')
-    print(f"Correlation Matrix Frobenius Error (Real vs Synthetic Defaults): {frobenius_error:.4f}")
+    print(
+        f"Correlation Matrix Frobenius Error (Real vs Synthetic Defaults): {frobenius_error:.4f}")
     print("Target: < 0.5 for 10-feature credit data (lower is better)")
 
     fig, axes = plt.subplots(1, 2, figsize=(18, 7))
-    sns.heatmap(real_corr, annot=True, fmt='.2f', cmap='coolwarm', ax=axes[0], cbar_kws={'shrink': 0.8})
+    sns.heatmap(real_corr, annot=True, fmt='.2f', cmap='coolwarm',
+                ax=axes[0], cbar_kws={'shrink': 0.8})
     axes[0].set_title('Real Defaults: Correlation Matrix', fontsize=16)
-    sns.heatmap(synth_corr, annot=True, fmt='.2f', cmap='coolwarm', ax=axes[1], cbar_kws={'shrink': 0.8})
-    axes[1].set_title('Synthetic Defaults (VAE): Correlation Matrix', fontsize=16)
-    plt.suptitle('Correlation Preservation: Real vs. Synthetic Defaults', fontsize=18, y=1.02)
+    sns.heatmap(synth_corr, annot=True, fmt='.2f', cmap='coolwarm',
+                ax=axes[1], cbar_kws={'shrink': 0.8})
+    axes[1].set_title(
+        'Synthetic Defaults (VAE): Correlation Matrix', fontsize=16)
+    plt.suptitle(
+        'Correlation Preservation: Real vs. Synthetic Defaults', fontsize=18, y=1.02)
     plt.tight_layout(rect=[0, 0.03, 1, 0.98])
     plt.savefig(output_filename, dpi=150)
-    plt.show()
 
-    return frobenius_error
+    return frobenius_error, fig
 
 
-def perform_privacy_assessment(X_train_scaled_defaults, synth_defaults_df, X_smote_new_scaled, output_filename='privacy_distance_histogram.png', random_state=42):
+def perform_privacy_assessment(X_train_scaled, y_train, synth_defaults_df, X_smote_new_scaled, output_filename='privacy_distance_histogram.png', random_state=42):
     """
     Assesses privacy by calculating nearest-neighbor distances between synthetic and real data.
 
     Args:
-        X_train_scaled_defaults (pd.DataFrame): Scaled real default training samples.
+        X_train_scaled (pd.DataFrame): Scaled training features.
+        y_train (pd.Series): Training labels.
         synth_defaults_df (pd.DataFrame): Scaled VAE-generated synthetic default samples.
         X_smote_new_scaled (pd.DataFrame): Scaled SMOTE-generated samples (only the new ones).
         output_filename (str): Filename to save the distance histogram plot.
         random_state (int): Seed for random operations.
 
     Returns:
-        dict: Dictionary containing privacy metrics (mean/min distances).
+        tuple: (min_distances_vae array, min_distances_smote array, matplotlib figure or None)
     """
     print("\n--- Privacy Assessment (Nearest-Neighbor Distance) ---")
-    privacy_metrics = {}
     min_distances_vae = np.array([])
     min_distances_smote = np.array([])
 
+    # Extract defaults from training data
+    X_train_scaled_defaults = X_train_scaled[y_train == 1]
+
     if X_train_scaled_defaults.empty:
         print("No real default samples available for privacy assessment.")
-        return privacy_metrics
+        return min_distances_vae, min_distances_smote, None
 
     if not synth_defaults_df.empty:
         nn_vae = NearestNeighbors(n_neighbors=1, metric='euclidean')
         nn_vae.fit(X_train_scaled_defaults)
-        
+
         sample_size_vae = min(len(synth_defaults_df), 10000)
-        vae_sample = synth_defaults_df.sample(sample_size_vae, random_state=random_state) if sample_size_vae < len(synth_defaults_df) else synth_defaults_df
+        vae_sample = synth_defaults_df.sample(sample_size_vae, random_state=random_state) if sample_size_vae < len(
+            synth_defaults_df) else synth_defaults_df
         distances_vae, _ = nn_vae.kneighbors(vae_sample)
         min_distances_vae = distances_vae.ravel()
 
         print("Privacy Assessment (VAE synthetic defaults):")
-        privacy_metrics['vae_mean_distance'] = np.mean(min_distances_vae)
-        privacy_metrics['vae_min_distance'] = np.min(min_distances_vae)
-        privacy_metrics['vae_close_records'] = (min_distances_vae < 0.5).sum()
-        print(f"  Mean distance to nearest real (VAE): {privacy_metrics['vae_mean_distance']:.4f}")
-        print(f"  Min distance (worst case VAE): {privacy_metrics['vae_min_distance']:.4f}")
-        print(f"  Records with distance < 0.5 (VAE): {privacy_metrics['vae_close_records']} / {len(min_distances_vae)}")
+        print(
+            f"  Mean distance to nearest real (VAE): {np.mean(min_distances_vae):.4f}")
+        print(
+            f"  Min distance (worst case VAE): {np.min(min_distances_vae):.4f}")
+        print(
+            f"  Records with distance < 0.5 (VAE): {(min_distances_vae < 0.5).sum()} / {len(min_distances_vae)}")
     else:
         print("VAE synthetic defaults dataframe is empty, skipping VAE privacy assessment.")
 
     if not X_smote_new_scaled.empty:
         nn_smote = NearestNeighbors(n_neighbors=1, metric='euclidean')
         nn_smote.fit(X_train_scaled_defaults)
-        
+
         sample_size_smote = min(len(X_smote_new_scaled), 10000)
-        smote_sample = X_smote_new_scaled.sample(sample_size_smote, random_state=random_state) if sample_size_smote < len(X_smote_new_scaled) else X_smote_new_scaled
+        smote_sample = X_smote_new_scaled.sample(sample_size_smote, random_state=random_state) if sample_size_smote < len(
+            X_smote_new_scaled) else X_smote_new_scaled
         distances_smote, _ = nn_smote.kneighbors(smote_sample)
         min_distances_smote = distances_smote.ravel()
 
         print("\nPrivacy Assessment (SMOTE generated records):")
-        privacy_metrics['smote_mean_distance'] = np.mean(min_distances_smote)
-        privacy_metrics['smote_min_distance'] = np.min(min_distances_smote)
-        privacy_metrics['smote_close_records'] = (min_distances_smote < 0.5).sum()
-        print(f"  Mean distance to nearest real (SMOTE): {privacy_metrics['smote_mean_distance']:.4f}")
-        print(f"  Min distance (worst case SMOTE): {privacy_metrics['smote_min_distance']:.4f}")
-        print(f"  Records with distance < 0.5 (SMOTE): {privacy_metrics['smote_close_records']} / {len(min_distances_smote)}")
+        print(
+            f"  Mean distance to nearest real (SMOTE): {np.mean(min_distances_smote):.4f}")
+        print(
+            f"  Min distance (worst case SMOTE): {np.min(min_distances_smote):.4f}")
+        print(
+            f"  Records with distance < 0.5 (SMOTE): {(min_distances_smote < 0.5).sum()} / {len(min_distances_smote)}")
         print("  (SMOTE samples are generally closer due to linear interpolation)")
     else:
         print("\nSMOTE-generated records not available for privacy comparison or dataframe is empty.")
 
+    fig = None
     if not synth_defaults_df.empty or not X_smote_new_scaled.empty:
-        plt.figure(figsize=(10, 6))
+        fig = plt.figure(figsize=(10, 6))
         if len(min_distances_vae) > 0:
-            sns.histplot(min_distances_vae, kde=True, color='red', label='VAE Synthetic', stat='density', alpha=0.6)
+            sns.histplot(min_distances_vae, kde=True, color='red',
+                         label='VAE Synthetic', stat='density', alpha=0.6)
         if len(min_distances_smote) > 0:
-            sns.histplot(min_distances_smote, kde=True, color='blue', label='SMOTE Synthetic', stat='density', alpha=0.6)
-        
-        plt.title('Nearest-Neighbor Distance to Real Defaults (Privacy Assessment)', fontsize=16)
+            sns.histplot(min_distances_smote, kde=True, color='blue',
+                         label='SMOTE Synthetic', stat='density', alpha=0.6)
+
+        plt.title(
+            'Nearest-Neighbor Distance to Real Defaults (Privacy Assessment)', fontsize=16)
         plt.xlabel('Distance to Closest Real Record', fontsize=12)
         plt.ylabel('Density', fontsize=12)
         plt.legend()
         plt.grid(axis='y', alpha=0.75)
         plt.tight_layout()
         plt.savefig(output_filename, dpi=150)
-        plt.show()
 
-    return privacy_metrics
+    return min_distances_vae, min_distances_smote, fig
 
 
 def perform_tsne_visualization(real_defaults_inv_df, synth_defaults_inv_df, n_viz_samples=2000, output_filename='tsne_real_vs_synthetic.png', random_state=42):
@@ -639,80 +834,98 @@ def perform_tsne_visualization(real_defaults_inv_df, synth_defaults_inv_df, n_vi
         n_viz_samples (int): Number of samples to use for visualization from each dataset.
         output_filename (str): Filename to save the t-SNE plot.
         random_state (int): Seed for random operations.
+
+    Returns:
+        matplotlib.figure.Figure or None: The generated figure or None if visualization cannot be performed.
     """
     print("\n--- t-SNE / PCA Scatter Plots ---")
     if real_defaults_inv_df.empty or synth_defaults_inv_df.empty:
         print("Skipping t-SNE visualization due to empty dataframes.")
-        return
+        return None
 
-    n_viz_samples = min(len(real_defaults_inv_df), len(synth_defaults_inv_df), n_viz_samples)
+    n_viz_samples = min(len(real_defaults_inv_df), len(
+        synth_defaults_inv_df), n_viz_samples)
 
     if n_viz_samples == 0:
         print("Not enough samples for t-SNE visualization.")
-        return
+        return None
 
-    real_viz = real_defaults_inv_df.sample(n=n_viz_samples, random_state=random_state)
-    synth_viz = synth_defaults_inv_df.sample(n=n_viz_samples, random_state=random_state)
+    real_viz = real_defaults_inv_df.sample(
+        n=n_viz_samples, random_state=random_state)
+    synth_viz = synth_defaults_inv_df.sample(
+        n=n_viz_samples, random_state=random_state)
 
     combined_viz_data = pd.concat([real_viz, synth_viz], ignore_index=True)
-    combined_viz_labels = ['Real'] * n_viz_samples + ['Synthetic (VAE)'] * n_viz_samples
+    combined_viz_labels = ['Real'] * n_viz_samples + \
+        ['Synthetic (VAE)'] * n_viz_samples
 
     n_components_pca = min(combined_viz_data.shape[1], 5)
     pca_results = combined_viz_data.values
-    if n_components_pca > 0: # Only apply PCA if there are features to reduce
+    if n_components_pca > 0:  # Only apply PCA if there are features to reduce
         pca = PCA(n_components=n_components_pca, random_state=random_state)
         pca_results = pca.fit_transform(combined_viz_data)
     else:
-        print("Warning: Not enough features for PCA, using raw data for t-SNE (if possible).")
+        print(
+            "Warning: Not enough features for PCA, using raw data for t-SNE (if possible).")
 
-    if pca_results.shape[1] > 1 and n_viz_samples > 1: # t-SNE needs at least 2 dimensions and > 1 sample
+    # t-SNE needs at least 2 dimensions and > 1 sample
+    if pca_results.shape[1] > 1 and n_viz_samples > 1:
         # Perplexity must be less than the number of samples
         perplexity_val = min(30, n_viz_samples - 1)
         if perplexity_val <= 0:
-            print(f"Cannot perform t-SNE: perplexity ({perplexity_val}) must be greater than 0.")
-            return
+            print(
+                f"Cannot perform t-SNE: perplexity ({perplexity_val}) must be greater than 0.")
+            return None
 
-        tsne = TSNE(n_components=2, random_state=random_state, perplexity=perplexity_val, n_iter=1000, learning_rate=200)
+        tsne = TSNE(n_components=2, random_state=random_state,
+                    perplexity=perplexity_val, max_iter=1000, learning_rate=200)
         tsne_results = tsne.fit_transform(pca_results)
     else:
         print("Warning: Data has 1 or fewer dimensions after PCA, or not enough samples for t-SNE to 2D.")
-        return
+        return None
 
-    plt.figure(figsize=(12, 8))
+    fig = plt.figure(figsize=(12, 8))
     sns.scatterplot(
         x=tsne_results[:, 0], y=tsne_results[:, 1],
-        hue=combined_viz_labels, palette={'Real': 'blue', 'Synthetic (VAE)': 'red'},
+        hue=combined_viz_labels, palette={
+            'Real': 'blue', 'Synthetic (VAE)': 'red'},
         alpha=0.6, s=50
     )
-    plt.title(f't-SNE Visualization of Real vs. VAE Synthetic Defaults (n={n_viz_samples} each)', fontsize=16)
+    plt.title(
+        f't-SNE Visualization of Real vs. VAE Synthetic Defaults (n={n_viz_samples} each)', fontsize=16)
     plt.xlabel('t-SNE Component 1', fontsize=12)
     plt.ylabel('t-SNE Component 2', fontsize=12)
     plt.legend(title='Data Type')
     plt.grid(True, linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.savefig(output_filename, dpi=150)
-    plt.show()
+
+    return fig
 
 
-def plot_roc_curves(y_test, y_probs_dict, output_filename='roc_curves_comparison.png'):
+def plot_roc_curves(y_test, y_probs, model_names, output_filename='roc_curves_comparison.png'):
     """
     Plots ROC curves for multiple models on a single graph.
 
     Args:
         y_test (pd.Series): True labels for the test set.
-        y_probs_dict (dict): Dictionary where keys are model names and values are probability arrays.
+        y_probs (list): List of probability arrays for the positive class from each model.
+        model_names (list): List of model names corresponding to y_probs.
         output_filename (str): Filename to save the ROC plot.
     """
     plt.figure(figsize=(10, 8))
     has_valid_probs = False
-    for model_name, y_prob in y_probs_dict.items():
+    for i in range(len(y_probs)):
+        y_prob = y_probs[i]
+        model_name = model_names[i]
         if y_prob is not None and len(y_prob) == len(y_test):
             fpr, tpr, _ = roc_curve(y_test, y_prob)
             auc = roc_auc_score(y_test, y_prob)
             plt.plot(fpr, tpr, label=f'{model_name} (AUC = {auc:.4f})')
             has_valid_probs = True
         else:
-            print(f"Warning: Skipping ROC curve for '{model_name}' due to invalid probabilities.")
+            print(
+                f"Warning: Skipping ROC curve for '{model_name}' due to invalid probabilities.")
 
     if has_valid_probs:
         plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
@@ -756,34 +969,38 @@ def generate_comparison_report_and_plots(results_dict, y_test, y_prob_base, y_pr
     print("=" * 70)
 
     if 'tstr_ratio' in results_dict and not np.isnan(results_dict['tstr_ratio']):
-        print(f"\nTSTR Ratio (Model trained on VAE synthetic, tested on real): {results_dict['tstr_ratio']:.2%}")
+        print(
+            f"\nTSTR Ratio (Model trained on VAE synthetic, tested on real): {results_dict['tstr_ratio']:.2%}")
 
     plt.figure(figsize=(12, 7))
     bar_width = 0.35
     index = np.arange(len(comparison_data['Method']))
 
-    plt.bar(index, comparison_data['AUC'], bar_width, label='AUC', color='steelblue', alpha=0.8)
-    plt.bar(index + bar_width, comparison_data['Average Precision'], bar_width, label='Average Precision', color='coral', alpha=0.8)
+    plt.bar(index, comparison_data['AUC'], bar_width,
+            label='AUC', color='steelblue', alpha=0.8)
+    plt.bar(index + bar_width, comparison_data['Average Precision'],
+            bar_width, label='Average Precision', color='coral', alpha=0.8)
 
     plt.xlabel('Augmentation Strategy', fontsize=12)
     plt.ylabel('Score', fontsize=12)
-    plt.title('Credit Default Model Performance: Augmentation Strategy Comparison', fontsize=16)
-    plt.xticks(index + bar_width / 2, comparison_data['Method'], rotation=15, ha='right', fontsize=10)
+    plt.title(
+        'Credit Default Model Performance: Augmentation Strategy Comparison', fontsize=16)
+    plt.xticks(index + bar_width / 2,
+               comparison_data['Method'], rotation=15, ha='right', fontsize=10)
     plt.legend()
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
     plt.savefig(output_filename_barchart, dpi=150)
     plt.show()
 
-    y_probabilities_dict = {
-        'Baseline': y_prob_base,
-        'SMOTE Augmented': y_prob_smote,
-        'VAE Augmented': y_prob_vae
-    }
+    y_probabilities_list = [y_prob_base, y_prob_smote, y_prob_vae]
+    model_names_list = ['Baseline', 'SMOTE Augmented', 'VAE Augmented']
+    
     if y_prob_tstr is not None and not np.isnan(results_dict.get('auc_tstr', np.nan)):
-        y_probabilities_dict['TSTR (Synth-Only)'] = y_prob_tstr
+        y_probabilities_list.append(y_prob_tstr)
+        model_names_list.append('TSTR (Synth-Only)')
 
-    plot_roc_curves(y_test, y_probabilities_dict, output_filename_roc)
+    plot_roc_curves(y_test, y_probabilities_list, model_names_list, output_filename_roc)
 
 
 def run_full_synthetic_data_pipeline(
@@ -830,16 +1047,19 @@ def run_full_synthetic_data_pipeline(
 
     # 3. SMOTE Augmentation and XGBoost
     model_smote, y_prob_smote, auc_smote, ap_smote, X_smote_resampled, y_smote_resampled = \
-        apply_smote_and_train_xgoost(X_train_scaled, y_train, X_test_scaled, y_test, random_state)
+        apply_smote_and_train_xgboost(
+            X_train_scaled, y_train, X_test_scaled, y_test, random_state)
     results['auc_smote'] = auc_smote
     results['ap_smote'] = ap_smote
     y_probabilities['y_prob_smote'] = y_prob_smote
 
-    X_smote_new_scaled = X_smote_resampled.iloc[len(X_train_scaled):] if len(X_smote_resampled) > len(X_train_scaled) else pd.DataFrame(columns=X_train_scaled.columns)
+    X_smote_new_scaled = X_smote_resampled.iloc[len(X_train_scaled):] if len(
+        X_smote_resampled) > len(X_train_scaled) else pd.DataFrame(columns=X_train_scaled.columns)
 
     # 4. Train CVAE
     cvae_model_instance, encoder, decoder, trained_latent_dim = \
-        train_cvae(X_train_scaled, y_train, latent_dim=latent_dim_cvae, epochs=vae_epochs, batch_size=vae_batch_size, validation_split=vae_validation_split)
+        train_cvae(X_train_scaled, y_train, latent_dim=latent_dim_cvae, epochs=vae_epochs,
+                   batch_size=vae_batch_size, validation_split=vae_validation_split)
 
     # 5. VAE Augmentation and XGBoost
     model_vae, y_prob_vae, auc_vae, ap_vae, X_vae_augmented, y_vae_augmented, synth_defaults_df_scaled = \
@@ -857,11 +1077,13 @@ def run_full_synthetic_data_pipeline(
 
     if not synth_defaults_df_scaled.empty:
         synth_defaults_raw = scaler.inverse_transform(synth_defaults_df_scaled)
-        synth_defaults_inv_df = pd.DataFrame(synth_defaults_raw, columns=X_train_scaled.columns)
-    
+        synth_defaults_inv_df = pd.DataFrame(
+            synth_defaults_raw, columns=X_train_scaled.columns)
+
     if not defaults_train.empty:
         real_defaults_raw = scaler.inverse_transform(defaults_train)
-        real_defaults_inv_df = pd.DataFrame(real_defaults_raw, columns=X_train_scaled.columns)
+        real_defaults_inv_df = pd.DataFrame(
+            real_defaults_raw, columns=X_train_scaled.columns)
 
     # 6. TSTR Protocol
     auc_tstr, y_prob_tstr, tstr_ratio = run_tstr_protocol(
@@ -872,23 +1094,35 @@ def run_full_synthetic_data_pipeline(
     y_probabilities['y_prob_tstr'] = y_prob_tstr
 
     # 7. Synthetic Data Quality & Privacy Assessment
-    key_features_for_overlay = ['utilization', 'income', 'debt_ratio', 'past_due_30']
-    
-    ks_results = perform_distribution_comparison(real_defaults_inv_df, synth_defaults_inv_df, key_features_for_overlay)
+    key_features_for_overlay = ['utilization',
+                                'income', 'debt_ratio', 'past_due_30']
+
+    ks_results, _ = perform_distribution_comparison(
+        real_defaults_inv_df, synth_defaults_inv_df, key_features_for_overlay)
     results['ks_results'] = ks_results
 
-    frobenius_error = perform_correlation_comparison(real_defaults_inv_df, synth_defaults_inv_df)
+    frobenius_error, _ = perform_correlation_comparison(
+        real_defaults_inv_df, synth_defaults_inv_df)
     results['frobenius_error'] = frobenius_error
 
     privacy_metrics = perform_privacy_assessment(
-        defaults_train,
+        X_train_scaled,
+        y_train,
         synth_defaults_df_scaled,
         X_smote_new_scaled,
         random_state=random_state
     )
-    results['privacy_metrics'] = privacy_metrics
+    # Unpack the tuple (compatibility with old code that expects dict)
+    min_distances_vae, min_distances_smote, _ = privacy_metrics
+    results['privacy_metrics'] = {
+        'vae_mean_distance': np.mean(min_distances_vae) if len(min_distances_vae) > 0 else np.nan,
+        'vae_min_distance': np.min(min_distances_vae) if len(min_distances_vae) > 0 else np.nan,
+        'smote_mean_distance': np.mean(min_distances_smote) if len(min_distances_smote) > 0 else np.nan,
+        'smote_min_distance': np.min(min_distances_smote) if len(min_distances_smote) > 0 else np.nan,
+    }
 
-    perform_tsne_visualization(real_defaults_inv_df, synth_defaults_inv_df, random_state=random_state)
+    perform_tsne_visualization(
+        real_defaults_inv_df, synth_defaults_inv_df, random_state=random_state)
 
     # 8. Consolidated Comparison Report and Plots
     generate_comparison_report_and_plots(
@@ -900,6 +1134,7 @@ def run_full_synthetic_data_pipeline(
     )
 
     return results
+
 
 if __name__ == "__main__":
     print("Starting the full synthetic data pipeline...")
