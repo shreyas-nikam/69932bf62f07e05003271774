@@ -20,8 +20,8 @@ jobs:
 
       - name: Build Docker image
         run: |
-          docker build -t qunikamshreyas/699328f9a9329869bcc2c120_streamlit_app:latest .
+          docker build -t qunikamshreyas/69932bf62f07e05003271774_streamlit_app:latest .
 
       - name: Push Docker image
         run: |
-          docker push qunikamshreyas/699328f9a9329869bcc2c120_streamlit_app:latest
+          docker push qunikamshreyas/69932bf62f07e05003271774_streamlit_app:latest
